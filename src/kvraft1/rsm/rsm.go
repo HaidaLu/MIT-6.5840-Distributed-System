@@ -1,7 +1,9 @@
 package rsm
 
 import (
+	"math/rand"
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
@@ -15,6 +17,21 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Me  int   // server that submitted the op
+	Id  int64 // random, so ops from before a restart can't match new ones
+	Req any
+}
+
+// a Submit() waiting for the op it passed to Start() to be applied.
+type waiter struct {
+	id   int64
+	term int         // term returned by Start()
+	ch   chan result // buffered, so the reader never blocks on it
+}
+
+type result struct {
+	err rpc.Err
+	rep any
 }
 
 
@@ -38,6 +55,8 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
+	waiters     map[int]*waiter // log index -> Submit() waiting on it
+	lastApplied int             // reader only: index of the last op/snapshot applied to sm
 }
 
 // servers[] contains the ports of the set of
@@ -61,10 +80,17 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
+		waiters:      make(map[int]*waiter),
 	}
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	// Raft doesn't resend its snapshot on restart; restore it here,
+	// before the reader applies the entries that follow it.
+	if snap := persister.ReadSnapshot(); len(snap) > 0 {
+		sm.Restore(snap)
+	}
+	go rsm.reader()
 	return rsm
 }
 
@@ -82,6 +108,103 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
 	// is the argument to Submit and id is a unique id for the op.
 
-	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	op := Op{Me: rsm.me, Id: rand.Int63(), Req: req}
+
+	// hold rsm.mu across Start() so the reader can't apply the op
+	// before its waiter is registered.
+	rsm.mu.Lock()
+	index, term, isLeader := rsm.rf.Start(op)
+	if !isLeader {
+		rsm.mu.Unlock()
+		return rpc.ErrWrongLeader, nil
+	}
+	w := &waiter{id: op.Id, term: term, ch: make(chan result, 1)}
+	rsm.waiters[index] = w
+	rsm.mu.Unlock()
+
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case res := <-w.ch:
+			return res.err, res.rep
+		case <-ticker.C:
+			// if we lost leadership the op may never commit.
+			if curTerm, isLeader := rsm.rf.GetState(); curTerm != term || !isLeader {
+				rsm.mu.Lock()
+				if rsm.waiters[index] == w {
+					delete(rsm.waiters, index)
+				}
+				rsm.mu.Unlock()
+				// the reader may have delivered just before we removed w.
+				select {
+				case res := <-w.ch:
+					return res.err, res.rep
+				default:
+					return rpc.ErrWrongLeader, nil
+				}
+			}
+		}
+	}
+}
+
+// apply committed ops and snapshots to the state machine, on every
+// peer, and hand each op's result to the Submit() waiting for it, if any.
+func (rsm *RSM) reader() {
+	for msg := range rsm.applyCh {
+		if msg.SnapshotValid {
+			rsm.applySnapshot(msg)
+		} else if msg.CommandValid {
+			rsm.applyCommand(msg)
+		}
+	}
+}
+
+func (rsm *RSM) applyCommand(msg raftapi.ApplyMsg) {
+	if msg.CommandIndex <= rsm.lastApplied {
+		return // already covered by a snapshot
+	}
+	rsm.lastApplied = msg.CommandIndex
+	op, ok := msg.Command.(Op)
+	if !ok {
+		return
+	}
+	rep := rsm.sm.DoOp(op.Req)
+
+	rsm.mu.Lock()
+	if w, ok := rsm.waiters[msg.CommandIndex]; ok {
+		delete(rsm.waiters, msg.CommandIndex)
+		if op.Me == rsm.me && op.Id == w.id {
+			w.ch <- result{rpc.OK, rep}
+		} else {
+			// a different op was committed at our index: we lost leadership.
+			w.ch <- result{rpc.ErrWrongLeader, nil}
+		}
+	}
+	rsm.mu.Unlock()
+
+	// snapshot at the op just applied, so the snapshot matches its index.
+	if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() >= rsm.maxraftstate {
+		rsm.rf.Snapshot(msg.CommandIndex, rsm.sm.Snapshot())
+	}
+}
+
+// a snapshot from the leader (InstallSnapshot) replaces our state.
+func (rsm *RSM) applySnapshot(msg raftapi.ApplyMsg) {
+	if msg.SnapshotIndex <= rsm.lastApplied {
+		return
+	}
+	rsm.sm.Restore(msg.Snapshot)
+	rsm.lastApplied = msg.SnapshotIndex
+
+	// ops the snapshot covers won't come through applyCh, and we can't
+	// tell whether ours were among them; let the clients retry.
+	rsm.mu.Lock()
+	for index, w := range rsm.waiters {
+		if index <= msg.SnapshotIndex {
+			delete(rsm.waiters, index)
+			w.ch <- result{rpc.ErrWrongLeader, nil}
+		}
+	}
+	rsm.mu.Unlock()
 }
