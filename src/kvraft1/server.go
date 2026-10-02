@@ -1,6 +1,8 @@
 package kvraft
 
 import (
+	"bytes"
+	"log"
 	"sync"
 
 	"6.5840/kvraft1/rsm"
@@ -68,11 +70,27 @@ func (kv *KVServer) doPut(args *rpc.PutArgs) rpc.PutReply {
 
 func (kv *KVServer) Snapshot() []byte {
 	// Your code here
-	return nil
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.data)
+	return w.Bytes()
 }
 
 func (kv *KVServer) Restore(data []byte) {
 	// Your code here
+	var m map[string]Entry
+	d := labgob.NewDecoder(bytes.NewBuffer(data))
+	if d.Decode(&m) != nil {
+		log.Fatalf("%v: couldn't decode snapshot", kv.me)
+	}
+	if m == nil {
+		m = make(map[string]Entry) // gob may decode an empty map as nil
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.data = m
 }
 
 func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {

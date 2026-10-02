@@ -55,7 +55,8 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
-	waiters map[int]*waiter // log index -> Submit() waiting on it
+	waiters     map[int]*waiter // log index -> Submit() waiting on it
+	lastApplied int             // reader only: index of the last op/snapshot applied to sm
 }
 
 // servers[] contains the ports of the set of
@@ -83,6 +84,11 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	}
 	if !tester.UseRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
+	}
+	// Raft doesn't resend its snapshot on restart; restore it here,
+	// before the reader applies the entries that follow it.
+	if snap := persister.ReadSnapshot(); len(snap) > 0 {
+		sm.Restore(snap)
 	}
 	go rsm.reader()
 	return rsm
@@ -142,29 +148,63 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	}
 }
 
-// apply committed ops to the state machine, on every peer, and hand
-// each result to the Submit() waiting for it, if any.
+// apply committed ops and snapshots to the state machine, on every
+// peer, and hand each op's result to the Submit() waiting for it, if any.
 func (rsm *RSM) reader() {
 	for msg := range rsm.applyCh {
-		if !msg.CommandValid {
-			continue // snapshots are handled in 4C
+		if msg.SnapshotValid {
+			rsm.applySnapshot(msg)
+		} else if msg.CommandValid {
+			rsm.applyCommand(msg)
 		}
-		op, ok := msg.Command.(Op)
-		if !ok {
-			continue
-		}
-		rep := rsm.sm.DoOp(op.Req)
-
-		rsm.mu.Lock()
-		if w, ok := rsm.waiters[msg.CommandIndex]; ok {
-			delete(rsm.waiters, msg.CommandIndex)
-			if op.Me == rsm.me && op.Id == w.id {
-				w.ch <- result{rpc.OK, rep}
-			} else {
-				// a different op was committed at our index: we lost leadership.
-				w.ch <- result{rpc.ErrWrongLeader, nil}
-			}
-		}
-		rsm.mu.Unlock()
 	}
+}
+
+func (rsm *RSM) applyCommand(msg raftapi.ApplyMsg) {
+	if msg.CommandIndex <= rsm.lastApplied {
+		return // already covered by a snapshot
+	}
+	rsm.lastApplied = msg.CommandIndex
+	op, ok := msg.Command.(Op)
+	if !ok {
+		return
+	}
+	rep := rsm.sm.DoOp(op.Req)
+
+	rsm.mu.Lock()
+	if w, ok := rsm.waiters[msg.CommandIndex]; ok {
+		delete(rsm.waiters, msg.CommandIndex)
+		if op.Me == rsm.me && op.Id == w.id {
+			w.ch <- result{rpc.OK, rep}
+		} else {
+			// a different op was committed at our index: we lost leadership.
+			w.ch <- result{rpc.ErrWrongLeader, nil}
+		}
+	}
+	rsm.mu.Unlock()
+
+	// snapshot at the op just applied, so the snapshot matches its index.
+	if rsm.maxraftstate != -1 && rsm.rf.PersistBytes() >= rsm.maxraftstate {
+		rsm.rf.Snapshot(msg.CommandIndex, rsm.sm.Snapshot())
+	}
+}
+
+// a snapshot from the leader (InstallSnapshot) replaces our state.
+func (rsm *RSM) applySnapshot(msg raftapi.ApplyMsg) {
+	if msg.SnapshotIndex <= rsm.lastApplied {
+		return
+	}
+	rsm.sm.Restore(msg.Snapshot)
+	rsm.lastApplied = msg.SnapshotIndex
+
+	// ops the snapshot covers won't come through applyCh, and we can't
+	// tell whether ours were among them; let the clients retry.
+	rsm.mu.Lock()
+	for index, w := range rsm.waiters {
+		if index <= msg.SnapshotIndex {
+			delete(rsm.waiters, index)
+			w.ch <- result{rpc.ErrWrongLeader, nil}
+		}
+	}
+	rsm.mu.Unlock()
 }
